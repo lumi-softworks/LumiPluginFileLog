@@ -1,0 +1,716 @@
+import Foundation
+import OSLog
+import LumiLoggingKit
+import ProviderDiagnostics
+
+/// 磁盘日志协调器
+///
+/// 通过 OSLogStore 订阅 Wakey 及其插件子 subsystem 的日志条目，
+/// 异步写入磁盘文件。支持自动轮转和过期清理。
+///
+/// ## 设计
+///
+/// ```text
+/// 现有代码（零改动）
+///   AppLogger.core.info("\(self.t)...")
+///   SomePlugin.logger.error("...")
+///         │
+///         ▼
+/// os.Logger → 系统统一日志（Console.app / log stream 可查）
+///         │
+///         ▼
+/// FileLogCoordinator（OSLogStore 轮询）
+///         │
+///         ▼
+/// ~/Library/Application Support/com.coffic.Wakey/db_debug_v1/com.coffic.wakey.plugin.file-log/
+///   ├── 2026-05-02_10-36-00.log
+///   ├── 2026-05-02_11-02-33.log
+///   └── ...
+/// ```
+public final class FileLogCoordinator: @unchecked Sendable, SuperLog, DiagnosticsProviding {
+    static let shared = FileLogCoordinator(branding: .lumi)
+
+    nonisolated static let logger = Logger(subsystem: "com.coffic.lumi", category: "plugin.file-log")
+    nonisolated public static let emoji = "📝"
+    nonisolated(unsafe) static var verbose: Bool = false
+
+    // MARK: - Constants
+
+    /// 品牌配置：订阅哪个 subsystem、写到哪个目录、诊断包叫什么名字。
+    let branding: FileLogBranding
+
+    private var subsystem: String { branding.subsystem }
+    private var directoryOverride: URL?
+    private var maxFileSize: Int
+    private var maxDirectorySize: Int
+    private var maxRetentionDays: Int
+    private var pollInterval: TimeInterval
+    private var writeDelay: TimeInterval
+
+    /// 读取 OSLog 的实现；测试可替换为假数据，避免依赖真实 logd。
+    public var logRecordReader: (String, Date) -> [LogRecord]?
+
+    // MARK: - State
+
+    private var queue: DispatchQueue
+    private var pollQueue: DispatchQueue
+    private var currentFileHandle: FileHandle?
+    private var currentFilePath: URL?
+    private var isRunning = false
+    private var isFileLoggingDisabled = false
+    private var lastPolledDate = Date.distantPast
+    private var pollTimer: DispatchSourceTimer?
+    private var pendingRecords: [LogRecord] = []
+    /// 采集水位线：记录已消费到的位置，避免重叠轮询重复写入，
+    /// 同时不像「已见 key 集合」那样无限增长。
+    private var watermark = LogWatermark()
+    private var pollInFlight = false
+
+    /// 心跳节流计数：每次 OSLog 轮询 tick 自增，每 N 次打一条日志。
+    private var pollTickCount = 0
+    private let pollTickLogEvery = 10
+
+    /// 纳入采集的 subsystem 前缀：根 subsystem 加上品牌声明的公共前缀。
+    private var includedSubsystemPrefixes: [String] {
+        [branding.subsystem] + branding.additionalSubsystemPrefixes
+    }
+
+    // MARK: - Log Directory
+
+    private var logsDirectory: URL {
+        directoryOverride ?? FileLogRuntimeBridge.logsDirectory ?? fallbackDirectory
+    }
+
+    public var logsDirectoryURL: URL { logsDirectory }
+
+    private var fallbackDirectory: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let bundleID = Bundle.main.bundleIdentifier ?? branding.subsystem
+        return appSupport
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent(branding.pluginID, isDirectory: true)
+    }
+
+    // MARK: - Public Lifecycle
+
+    public init(
+        branding: FileLogBranding = .lumi,
+        logsDirectory: URL? = nil,
+        maxFileSize: Int = 5 * 1024 * 1024,
+        maxDirectorySize: Int = 50 * 1024 * 1024,
+        maxRetentionDays: Int = 7,
+        pollInterval: TimeInterval = 2.0,
+        writeDelay: TimeInterval = 3.0
+    ) {
+        self.branding = branding
+        self.directoryOverride = logsDirectory
+        self.maxFileSize = maxFileSize
+        self.maxDirectorySize = maxDirectorySize
+        self.maxRetentionDays = maxRetentionDays
+        self.pollInterval = pollInterval
+        self.writeDelay = writeDelay
+        self.queue = DispatchQueue(label: "\(branding.subsystem).file-log", qos: .utility)
+        self.pollQueue = DispatchQueue(label: "\(branding.subsystem).file-log.poll", qos: .utility)
+        self.logRecordReader = { subsystem, sinceDate in
+            FileLogCoordinator.readLogRecords(subsystem: subsystem, since: sinceDate, branding: branding)
+        }
+    }
+
+    /// 启动磁盘日志收集
+    public func start() {
+        queue.async { [self] in
+            guard !isRunning else { return }
+            isRunning = true
+            isFileLoggingDisabled = false
+            lastPolledDate = Date().addingTimeInterval(-writeDelay)
+            pendingRecords = []
+            watermark.reset()
+            if Self.verbose { Self.logger.info("\(Self.t)启动 OSLog 轮询(间隔 \(self.pollInterval)s)，写入 \(self.logsDirectory.path)") }
+            purgeExpiredLogs()
+            purgeOversizedLogs()
+            rotateLogFile()
+            schedulePollTimer()
+        }
+    }
+
+    /// 停止磁盘日志收集并 flush 剩余条目
+    public func stop() {
+        queue.async { [self] in
+            stopOnQueue()
+        }
+    }
+
+    /// 同步停止日志收集，用于卸载前确保文件句柄已经关闭。
+    public func stopAndWait() {
+        queue.sync { [self] in
+            stopOnQueue()
+        }
+    }
+
+    private func stopOnQueue() {
+        guard isRunning else { return }
+        isRunning = false
+        pollTimer?.cancel()
+        pollTimer = nil
+        writePendingRecords(upTo: .distantFuture)
+        flushCurrentFile()
+        closeCurrentFile()
+    }
+
+    // MARK: - Log Rotation
+
+    private func rotateLogFile() {
+        closeCurrentFile()
+        guard !isFileLoggingDisabled else { return }
+
+        do {
+            try Self.prepareLogsDirectory(logsDirectory)
+        } catch {
+            handleFileWriteFailure(error)
+            return
+        }
+
+        let filename = Self.logFilename(
+            for: Date(),
+            processID: ProcessInfo.processInfo.processIdentifier
+        )
+        let filePath = logsDirectory.appendingPathComponent(filename)
+
+        guard FileManager.default.createFile(atPath: filePath.path, contents: nil) else {
+            handleFileWriteFailure(CocoaError(.fileWriteUnknown))
+            return
+        }
+
+        do {
+            currentFileHandle = try FileHandle(forWritingTo: filePath)
+        } catch {
+            handleFileWriteFailure(error)
+            return
+        }
+        currentFilePath = filePath
+
+        // 写入 header
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+
+        #if DEBUG
+        let environment = "Debug"
+        #else
+        let environment = "Production"
+        #endif
+
+        let majorVersion = version.split(separator: ".").first.flatMap { Int($0) } ?? 1
+
+        let header = """
+        === \(branding.applicationName) Log ===
+        Version: \(version) (\(build))
+        Environment: \(environment)
+        Database Version: v\(majorVersion)
+        Date: \(Date())
+        ===
+
+        """
+        writeData(Data(header.utf8))
+    }
+
+    static func prepareLogsDirectory(_ directory: URL, fileManager: FileManager = .default) throws {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    private func closeCurrentFile() {
+        guard let handle = currentFileHandle else { return }
+        currentFileHandle = nil
+        currentFilePath = nil
+        var closeError: Error?
+        do {
+            try handle.synchronize()
+        } catch {
+            closeError = error
+        }
+
+        do {
+            try handle.close()
+        } catch {
+            closeError = closeError ?? error
+        }
+
+        if let closeError {
+            handleFileWriteFailure(closeError)
+        }
+    }
+
+    // MARK: - Polling
+
+    private func schedulePollTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.startPollIfNeeded()
+        }
+        timer.resume()
+        pollTimer = timer
+    }
+
+    /// 等待内部队列排空。
+    ///
+    /// `start()` 把准备工作排在内部队列上，调用方需要确认它已经完成时
+    /// （例如测试要检查刚创建的文件）可以用这个入口。
+    public func waitForPendingWork() {
+        queue.sync { }
+    }
+
+    /// 同步执行一轮轮询。
+    ///
+    /// 定时轮询走 `pollQueue` 异步读取；这个入口在当前线程同步读完再返回，
+    /// 供测试在没有定时器的情况下复现一次采集。
+    public func pollOnce() {
+        let startDate = lastPolledDate
+        let pollDate = Date()
+        guard let records = logRecordReader(subsystem, startDate) else { return }
+
+        queue.sync { [self] in
+            guard isRunning, !isFileLoggingDisabled else { return }
+            consume(records, upTo: pollDate.addingTimeInterval(-writeDelay))
+        }
+    }
+
+    private func startPollIfNeeded() {
+        guard isRunning, !isFileLoggingDisabled, !pollInFlight else { return }
+
+        pollInFlight = true
+        let startDate = lastPolledDate
+        let pollDate = Date()
+        let subsystem = self.subsystem
+
+        pollQueue.async { [weak self] in
+            let records = self?.logRecordReader(subsystem, startDate)
+
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                self.pollInFlight = false
+                guard self.isRunning, !self.isFileLoggingDisabled else { return }
+                guard let records else { return }
+
+                self.lastPolledDate = pollDate.addingTimeInterval(-self.writeDelay)
+                self.consume(records, upTo: pollDate.addingTimeInterval(-self.writeDelay))
+
+                self.pollTickCount += 1
+                if Self.verbose, self.pollTickCount % self.pollTickLogEvery == 0 {
+                    Self.logger.info("\(Self.t)tick #\(self.pollTickCount) OSLog 轮询完成，本轮读到 \(records.count) 条，待写 \(self.pendingRecords.count) 条")
+                }
+            }
+        }
+    }
+
+    /// 按时间顺序消费读到的记录，用水位线跳过重叠窗口里已写过的条目。
+    ///
+    /// 位置由「时间戳 + 同刻序号」构成，因此内容相同的两条消息不会被误当成
+    /// 一条而丢掉。同刻序号是该时间戳内条目的累计序号（而非本轮数组下标），
+    /// 这样重叠轮询读到的同一条目在两轮中位置相同，水位线判断才可靠。
+    private func consume(_ records: [LogRecord], upTo cutoff: Date) {
+        var ordinalsByTime: [TimeInterval: Int] = [:]
+        for record in records {
+            let time = record.date.timeIntervalSinceReferenceDate
+            let ordinal = ordinalsByTime[time, default: 0]
+            ordinalsByTime[time] = ordinal + 1
+
+            let position = LogWatermark.Position(time: time, ordinal: ordinal)
+            guard !watermark.isConsumed(position) else { continue }
+            watermark.advance(to: position)
+            pendingRecords.append(record)
+        }
+
+        let wroteRecords = writePendingRecords(upTo: cutoff)
+        if wroteRecords {
+            flushCurrentFile()
+            if !isFileLoggingDisabled {
+                checkFileSize()
+            }
+        }
+    }
+
+    private static func readLogRecords(subsystem: String, since date: Date, branding: FileLogBranding) -> [LogRecord]? {
+        let store: OSLogStore
+        do {
+            store = try OSLogStore(scope: .currentProcessIdentifier)
+        } catch {
+            return nil
+        }
+
+        let position = store.position(date: date)
+        guard let entries = try? store.getEntries(
+            at: position,
+            matching: Self.subsystemPredicate(for: subsystem, branding: branding)
+        ) else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+
+        let records = entries.map { entry in
+            LogRecord(
+                date: entry.date,
+                line: Self.formatEntry(entry, formatter: formatter)
+            )
+        }
+
+        return records
+    }
+
+    private static func formatEntry(_ entry: OSLogEntry, formatter: DateFormatter) -> String {
+        let time = formatter.string(from: entry.date)
+        if let logEntry = entry as? OSLogEntryLog {
+            let level = logEntry.level.stringValue
+            return "[\(time)] [\(level)] [\(logEntry.category)] \(entry.composedMessage)\n"
+        }
+        return "[\(time)] \(entry.composedMessage)\n"
+    }
+
+    public struct LogRecord: Sendable {
+        public let date: Date
+        public let line: String
+
+        public init(date: Date, line: String) {
+            self.date = date
+            self.line = line
+        }
+    }
+
+    static func recordsReadyToWrite(_ records: [LogRecord], upTo cutoff: Date) -> (ready: [LogRecord], pending: [LogRecord]) {
+        let orderedRecords = records
+            .enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.date == rhs.element.date {
+                    return lhs.offset < rhs.offset
+                }
+                return lhs.element.date < rhs.element.date
+            }
+
+        var ready: [LogRecord] = []
+        var pending: [LogRecord] = []
+        ready.reserveCapacity(orderedRecords.count)
+        pending.reserveCapacity(orderedRecords.count)
+
+        for record in orderedRecords.map(\.element) {
+            if record.date <= cutoff {
+                ready.append(record)
+            } else {
+                pending.append(record)
+            }
+        }
+
+        return (ready, pending)
+    }
+
+    static func subsystemPredicate(for rootSubsystem: String, branding: FileLogBranding) -> NSPredicate {
+        let prefixes = ([branding.subsystem] + branding.additionalSubsystemPrefixes).map { prefix in
+            let effectivePrefix = prefix == branding.subsystem ? rootSubsystem : prefix
+            return NSCompoundPredicate(orPredicateWithSubpredicates: [
+                NSPredicate(format: "subsystem == %@", effectivePrefix),
+                NSPredicate(format: "subsystem BEGINSWITH %@", "\(effectivePrefix)."),
+            ])
+        }
+        return NSCompoundPredicate(orPredicateWithSubpredicates: prefixes)
+    }
+
+    static func logFilename(for date: Date, processID: Int32) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return "\(formatter.string(from: date))_pid-\(processID).log"
+    }
+
+    // MARK: - Write
+
+    private func writeData(_ data: Data) {
+        guard let handle = currentFileHandle, !isFileLoggingDisabled else { return }
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            handleFileWriteFailure(error)
+        }
+    }
+
+    @discardableResult
+    private func writePendingRecords(upTo cutoff: Date) -> Bool {
+        let result = Self.recordsReadyToWrite(pendingRecords, upTo: cutoff)
+        pendingRecords = result.pending
+
+        for record in result.ready {
+            writeData(Data(record.line.utf8))
+        }
+
+        return !result.ready.isEmpty
+    }
+
+    private func flushCurrentFile() {
+        guard let handle = currentFileHandle, !isFileLoggingDisabled else { return }
+        do {
+            try handle.synchronize()
+        } catch {
+            handleFileWriteFailure(error)
+        }
+    }
+
+    private func handleFileWriteFailure(_: Error) {
+        guard !isFileLoggingDisabled else { return }
+        isFileLoggingDisabled = true
+        isRunning = false
+        pollTimer?.cancel()
+        pollTimer = nil
+
+        let handle = currentFileHandle
+        currentFileHandle = nil
+        currentFilePath = nil
+        try? handle?.close()
+    }
+
+    private func checkFileSize() {
+        guard let path = currentFilePath,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
+              let size = attrs[.size] as? Int,
+              size > maxFileSize else { return }
+        rotateLogFile()
+        purgeOversizedLogs()
+    }
+
+    // MARK: - Cleanup
+
+    private func purgeExpiredLogs() {
+        let files = logFiles(in: logsDirectory)
+
+        let cutoff = Calendar.current.date(
+            byAdding: .day, value: -maxRetentionDays, to: Date()
+        )!
+
+        for file in files {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+                  let creationDate = attrs[.creationDate] as? Date,
+                  creationDate < cutoff else { continue }
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    private func purgeOversizedLogs() {
+        var files = logFiles(in: logsDirectory)
+
+        // 当前正在写入的文件不能删：删掉后 FileHandle 仍指向已删除的
+        // inode，后续日志会静默丢失。跳过它，只清理历史文件。
+        let currentPath = currentFilePath?.standardizedFileURL
+        files.removeAll { file in
+            currentPath != nil && file.standardizedFileURL == currentPath
+        }
+
+        var totalSize = files.reduce(0) { total, file in
+            total + ((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+
+        guard totalSize > maxDirectorySize else { return }
+
+        files.sort { lhs, rhs in
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return lhsDate < rhsDate
+        }
+
+        for file in files where totalSize > maxDirectorySize {
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            try? FileManager.default.removeItem(at: file)
+            totalSize -= size
+        }
+    }
+
+    private func logFiles(in directory: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.creationDateKey, .fileSizeKey],
+            options: .skipsHiddenFiles
+        ))?.filter { $0.pathExtension.lowercased() == "log" } ?? []
+    }
+
+    static func migrateLegacyDirectory(
+        from legacyDirectory: URL,
+        to currentDirectory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard legacyDirectory.standardizedFileURL != currentDirectory.standardizedFileURL,
+              fileManager.fileExists(atPath: legacyDirectory.path) else { return }
+
+        try prepareLogsDirectory(currentDirectory, fileManager: fileManager)
+        // 不能跳过隐藏文件：否则 `.important.log` 不会被迁移，而下面判断目录为空时
+        // 同样看不见它，最终 `removeItem` 会递归删掉从未检查过的内容（#999）。
+        let legacyFiles = try fileManager.contentsOfDirectory(
+            at: legacyDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension.lowercased() == "log" }
+
+        for legacyFile in legacyFiles {
+            var destination = currentDirectory.appendingPathComponent(legacyFile.lastPathComponent)
+            if fileManager.fileExists(atPath: destination.path) {
+                let baseName = legacyFile.deletingPathExtension().lastPathComponent
+                let extensionName = legacyFile.pathExtension
+                let suffix = UUID().uuidString
+                let migratedName = extensionName.isEmpty
+                    ? "\(baseName)-legacy-\(suffix)"
+                    : "\(baseName)-legacy-\(suffix).\(extensionName)"
+                destination = currentDirectory.appendingPathComponent(migratedName)
+            }
+            try fileManager.moveItem(at: legacyFile, to: destination)
+        }
+
+        // 只有包含隐藏条目在内的完整枚举确认目录为空才删除；`removeItem` 对目录是
+        // 递归删除，跳过隐藏文件时的空数组不能当作“目录已空”。
+        if (try? fileManager.contentsOfDirectory(
+            at: legacyDirectory,
+            includingPropertiesForKeys: nil
+        ).isEmpty) == true {
+            try? fileManager.removeItem(at: legacyDirectory)
+        }
+    }
+
+    // MARK: - Diagnostics Export
+
+    public func makeDiagnosticsArchive() async throws -> DiagnosticsArchive {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DiagnosticsArchive, Error>) in
+            queue.async { [self] in
+                do {
+                    drainLogRecordsBeforeExport()
+                    _ = writePendingRecords(upTo: .distantFuture)
+                    flushCurrentFile()
+                    let archive = try makeDiagnosticsArchiveOnQueue()
+                    continuation.resume(returning: archive)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// 导出诊断前同步补一次 OSLog 读取，把「已产生但还没等到下一轮轮询」的日志
+    /// 也纳入归档。运行在 `queue` 上，与在途轮询结果的回写天然串行，不会丢条目；
+    /// 水位线保证不会重复写入。
+    private func drainLogRecordsBeforeExport() {
+        guard isRunning, !isFileLoggingDisabled else { return }
+        guard let records = logRecordReader(subsystem, lastPolledDate) else { return }
+
+        consume(records, upTo: .distantFuture)
+    }
+
+    private func makeDiagnosticsArchiveOnQueue() throws -> DiagnosticsArchive {
+        let fileManager = FileManager.default
+        let stagingDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("\(branding.diagnosticsArchiveNamePrefix)-\(UUID().uuidString)", isDirectory: true)
+        let stagedLogsDirectory = stagingDirectory.appendingPathComponent("logs", isDirectory: true)
+        try fileManager.createDirectory(at: stagedLogsDirectory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: stagingDirectory) }
+
+        for source in logFiles(in: logsDirectory) {
+            let destination = stagedLogsDirectory.appendingPathComponent(source.lastPathComponent)
+            try fileManager.copyItem(at: source, to: destination)
+        }
+
+        let manifest = DiagnosticManifest(
+            exportedAt: Date(),
+            version: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
+            build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",
+            environment: Self.environmentName,
+            operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
+            architecture: Self.architectureName,
+            processID: ProcessInfo.processInfo.processIdentifier,
+            logFileCount: logFiles(in: logsDirectory).count
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let manifestData = try encoder.encode(manifest)
+        try manifestData.write(to: stagingDirectory.appendingPathComponent("manifest.json"), options: .atomic)
+
+        let filename = "\(branding.diagnosticsArchiveNamePrefix)-\(Self.archiveTimestamp()).zip"
+        let archiveURL = fileManager.temporaryDirectory.appendingPathComponent(filename)
+        try? fileManager.removeItem(at: archiveURL)
+        try runDittoArchive(source: stagingDirectory, destination: archiveURL)
+        return DiagnosticsArchive(url: archiveURL, filename: filename)
+    }
+
+    private func runDittoArchive(source: URL, destination: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, destination.path]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        try process.run()
+        process.waitUntilExit()
+        // 确定性回收管道 fd：本方法会在诊断导出时反复调用，不能依赖 autorelease pool。
+        defer {
+            try? errorPipe.fileHandleForReading.close()
+            try? errorPipe.fileHandleForWriting.close()
+        }
+        guard process.terminationStatus == 0 else {
+            let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+                ?? "ditto exited with status \(process.terminationStatus)"
+            throw FileLogError.archiveCreationFailed(error.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    private static var environmentName: String {
+        #if DEBUG
+        return "Debug"
+        #else
+        return "Production"
+        #endif
+    }
+
+    private static var architectureName: String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x86_64"
+        #else
+        return "unknown"
+        #endif
+    }
+
+    private static func archiveTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return formatter.string(from: Date())
+    }
+
+    private struct DiagnosticManifest: Codable {
+        let exportedAt: Date
+        let version: String
+        let build: String
+        let environment: String
+        let operatingSystem: String
+        let architecture: String
+        let processID: Int32
+        let logFileCount: Int
+    }
+
+    private enum FileLogError: LocalizedError {
+        case archiveCreationFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .archiveCreationFailed(message):
+                return "无法创建诊断日志压缩包：\(message)"
+            }
+        }
+    }
+}
+
+// MARK: - OSLogEntryLog.Level String Representation
+
+extension OSLogEntryLog.Level {
+    var stringValue: String {
+        switch self {
+        case .undefined:    return "VERBOSE"
+        case .debug:        return "DEBUG"
+        case .info:         return "INFO"
+        case .notice:       return "NOTICE"
+        case .error:        return "ERROR"
+        case .fault:        return "FAULT"
+        @unknown default:   return "UNKNOWN"
+        }
+    }
+}
