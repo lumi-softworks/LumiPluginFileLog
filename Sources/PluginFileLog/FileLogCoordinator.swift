@@ -627,10 +627,48 @@ public final class FileLogCoordinator: @unchecked Sendable, SuperLog, Diagnostic
         let filename = "\(branding.diagnosticsArchiveNamePrefix)-\(Self.archiveTimestamp()).zip"
         let archiveURL = fileManager.temporaryDirectory.appendingPathComponent(filename)
         try? fileManager.removeItem(at: archiveURL)
+        #if os(macOS)
         try runDittoArchive(source: stagingDirectory, destination: archiveURL)
+        #else
+        try writeZipArchive(source: stagingDirectory, destination: archiveURL)
+        #endif
         return DiagnosticsArchive(url: archiveURL, filename: filename)
     }
 
+    /// iOS 等无法启动外部进程的平台：用纯 Foundation 的 store-only ZIP 打包。
+    ///
+    /// 归档内路径相对 `source` 目录（如 `logs/xxx.log`、`manifest.json`），
+    /// 与 ditto 的 `--keepParent` 相比少一层随机临时目录，解压后更直观。
+    private func writeZipArchive(source: URL, destination: URL) throws {
+        do {
+            let fileManager = FileManager.default
+            guard let enumerator = fileManager.enumerator(
+                at: source,
+                includingPropertiesForKeys: [.isRegularFileKey]
+            ) else {
+                throw FileLogError.archiveCreationFailed("无法枚举待打包目录：\(source.lastPathComponent)")
+            }
+
+            let baseComponents = source.standardizedFileURL.pathComponents
+            var entries: [(path: String, url: URL)] = []
+            for case let url as URL in enumerator {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+                guard values.isRegularFile == true else { continue }
+                let relative = url.standardizedFileURL.pathComponents
+                    .dropFirst(baseComponents.count)
+                    .joined(separator: "/")
+                entries.append((relative, url))
+            }
+
+            try StoreOnlyZipWriter().write(entries: entries, to: destination)
+        } catch let error as FileLogError {
+            throw error
+        } catch {
+            throw FileLogError.archiveCreationFailed(error.localizedDescription)
+        }
+    }
+
+    #if os(macOS)
     private func runDittoArchive(source: URL, destination: URL) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -650,6 +688,7 @@ public final class FileLogCoordinator: @unchecked Sendable, SuperLog, Diagnostic
             throw FileLogError.archiveCreationFailed(error.trimmingCharacters(in: .whitespacesAndNewlines))
         }
     }
+    #endif
 
     private static var environmentName: String {
         #if DEBUG
